@@ -9,58 +9,48 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
+	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
+	"github.com/libp2p/go-libp2p/p2p/transport/websocket"
 	"github.com/multiformats/go-multiaddr"
 )
 
 func main() {
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	// 1. Create a client host
-	h, err := libp2p.New()
-	if err != nil {
-		panic(err)
-	}
+	h, err := libp2p.New(
+		libp2p.ChainOptions(
+			libp2p.Transport(tcp.NewTCPTransport),
+			libp2p.Transport(websocket.New),
+		),
+	)
+	if err != nil { panic(err) }
 
 	fmt.Println("Client Peer ID:", h.ID())
 
-	// 2. Relay address (PASTE FROM SERVER)
-	relayAddrStr := "/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWP78VeM3RoYwnzJ2iM3itoNp6rLv8GTuUnpN853engtUF"
+	relayAddrStr := "/dns4/zeroxnet-relay-server.onrender.com/tcp/443/wss/p2p/12D3KooWRaJtqkLhngjzAfMjiabgKQG1Unu1ouW1ceREs4boytTy"
+	relayMA, _ := multiaddr.NewMultiaddr(relayAddrStr)
+	relayInfo, _ := peer.AddrInfoFromP2pAddr(relayMA)
 
-	relayMA, err := multiaddr.NewMultiaddr(relayAddrStr)
-	if err != nil {
-		panic(err)
-	}
-
-	relayInfo, err := peer.AddrInfoFromP2pAddr(relayMA)
-	if err != nil {
-		panic(err)
-	}
-
-	// 3. Connect to relay
 	if err := h.Connect(ctx, *relayInfo); err != nil {
-		panic(err)
+		fmt.Printf("❌ Connection failed: %v\n", err)
+		return
 	}
-	fmt.Println("✅ Connected to relay")
 
-	// 4. Reserve a relay slot
 	_, err = client.Reserve(ctx, h, *relayInfo)
 	if err != nil {
-		panic(err)
+		fmt.Printf("❌ Reservation failed: %v\n", err)
+		return
 	}
-	fmt.Println("📡 Relay reservation successful")
+	fmt.Println("✅ Client Reserved on Relay!")
 
-	const KeepAliveProtocol = "/keepalive/1.0.0"
-
-	h.SetStreamHandler(KeepAliveProtocol, func(s network.Stream) {
-		fmt.Println("🔗 Keepalive stream opened from", s.Conn().RemotePeer())
-		defer s.Close()
-
-		// Block forever (or until context cancel)
-		<-server.ctx.Done()
+	h.SetStreamHandler("/keepalive/1.0.0", func(s network.Stream) {
+		fmt.Println("🔗 Stream received!")
+		s.Close()
 	})
 
-	// Keep running
 	select {
+	case <-ctx.Done():
 	case <-time.After(time.Hour):
 	}
 }
