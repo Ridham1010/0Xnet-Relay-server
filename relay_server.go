@@ -35,46 +35,27 @@ type RelayServer struct {
 	peersConnected   map[peer.ID]time.Time
 }
 
-type Stats struct {
-	PeerID           string   `json:"peer_id"`
-	Uptime           string   `json:"uptime"`
-	UptimeSeconds    float64  `json:"uptime_seconds"`
-	ConnectedPeers   int      `json:"connected_peers"`
-	TotalConnections int64    `json:"total_connections"`
-	RelayAddresses   []string `json:"relay_addresses"`
-}
-
 func main() {
-	// IMPORTANT: Render maps its public URL to whatever is in os.Getenv("PORT")
-	// We want the LIBP2P RELAY to be on that port.
 	renderPort := os.Getenv("PORT")
 	if renderPort == "" {
 		renderPort = "8080"
 	}
-
-	// We'll put the HTTP Stats on a different port. 
-	// (Note: This means the Web UI won't be reachable from the internet on Render, 
-	// but the Relay connection will FINALLY work).
 	internalHttpPort := "9090"
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Start the Relay on the main Render port
 	server, err := NewRelayServer(ctx, renderPort)
 	if err != nil {
 		log.Fatalf("Failed to start relay: %v", err)
 	}
 
-	// Start HTTP server on a secondary port to avoid conflict
 	go startHTTPServer(internalHttpPort, server)
-
 	printStartupInfo(server, internalHttpPort, renderPort)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
-
 	server.Stop()
 }
 
@@ -82,19 +63,15 @@ func NewRelayServer(ctx context.Context, p2pPort string) (*RelayServer, error) {
 	ctx, cancel := context.WithCancel(ctx)
 
 	var privKey crypto.PrivKey
-	privKeyHex := os.Getenv("PRIVATE_KEY")
-	if privKeyHex != "" {
+	if privKeyHex := os.Getenv("PRIVATE_KEY"); privKeyHex != "" {
 		keyBytes, _ := crypto.ConfigDecodeKey(privKeyHex)
 		privKey, _ = crypto.UnmarshalPrivateKey(keyBytes)
-	}
-	if privKey == nil {
+	} else {
 		privKey, _, _ = crypto.GenerateEd25519Key(rand.Reader)
-		// Print it so you can save it to Render Env Vars later
-		keyBytes, _ := crypto.MarshalPrivateKey(privKey)
-		fmt.Printf("\n🔑 NEW PRIVATE_KEY (Save this!): %s\n\n", crypto.ConfigEncodeKey(keyBytes))
+		kb, _ := crypto.MarshalPrivateKey(privKey)
+		fmt.Printf("\n🔑 NEW PRIVATE_KEY: %s\n\n", crypto.ConfigEncodeKey(kb))
 	}
 
-	// Listen addresses using the p2pPort (which is the Render $PORT)
 	tcpAddr, _ := multiaddr.NewMultiaddr(fmt.Sprintf("/ip4/0.0.0.0/tcp/%s", p2pPort))
 	wsAddr, _ := multiaddr.NewMultiaddr(fmt.Sprintf("/ip4/0.0.0.0/tcp/%s/ws", p2pPort))
 
@@ -104,19 +81,49 @@ func NewRelayServer(ctx context.Context, p2pPort string) (*RelayServer, error) {
 		libp2p.Identity(privKey),
 		libp2p.Security(libp2ptls.ID, libp2ptls.New),
 		libp2p.Security(noise.ID, noise.New),
+		// FIX: Force public reachability so the relay doesn't hide
+		libp2p.ForceReachabilityPublic(),
+		// FIX: Disable strict resource limits for development
+		libp2p.ResourceManager(&network.NullResourceManager{}),
 		libp2p.EnableRelayService(
 			relay.WithResources(relay.Resources{
-				MaxReservations: 1024,
-				MaxReservationsPerPeer: 5,
-				ReservationTTL:  time.Hour,
+				MaxReservations:        2048,
+				MaxReservationsPerPeer: 20, // Allow many restarts from same IP
+				ReservationTTL:         time.Hour,
 			}),
 		),
-		libp2p.ForceReachabilityPublic(),
 	)
 	if err != nil {
 		cancel()
 		return nil, err
 	}
+
+	server := &RelayServer{
+		host:           h,
+		ctx:            ctx,
+		cancel:         cancel,
+		startTime:      time.Now(),
+		peersConnected: make(map[peer.ID]time.Time),
+	}
+
+	h.Network().Notify(&network.NotifyBundle{
+		ConnectedF: func(n network.Network, c network.Conn) {
+			server.mu.Lock()
+			server.totalConnections++
+			server.peersConnected[c.RemotePeer()] = time.Now()
+			server.mu.Unlock()
+			log.Printf("✅ Peer Connected: %s", c.RemotePeer())
+		},
+		DisconnectedF: func(n network.Network, c network.Conn) {
+			server.mu.Lock()
+			delete(server.peersConnected, c.RemotePeer())
+			server.mu.Unlock()
+			log.Printf("❌ Peer Disconnected: %s", c.RemotePeer())
+		},
+	})
+
+	return server, nil
+}
 
 	server := &RelayServer{
 		host:           h,
